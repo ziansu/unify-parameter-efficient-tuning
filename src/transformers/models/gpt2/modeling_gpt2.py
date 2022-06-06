@@ -15,9 +15,11 @@
 # limitations under the License.
 """PyTorch OpenAI GPT-2 model."""
 
+"""NOTE by Zian: additional local soft prompts"""
+
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import torch
 import torch.utils.checkpoint
@@ -36,6 +38,7 @@ from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
 )
 from ...modeling_utils import (
     Conv1D,
@@ -48,9 +51,9 @@ from ...utils import logging
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_gpt2 import GPT2Config
 
-# added by Junxian
-#from controller import override_func
-
+import sys
+sys.path.insert(2, "./")
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer
 
 logger = logging.get_logger(__name__)
 
@@ -126,7 +129,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 
 
 class GPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False):
+    def __init__(self, config, is_cross_attention=False, cache_key: str = None, layer_id=0):
         super().__init__()
 
         max_positions = config.max_position_embeddings
@@ -230,6 +233,8 @@ class GPT2Attention(nn.Module):
         encoder_attention_mask=None,
         use_cache=False,
         output_attentions=False,
+        prefix_state: Optional[Dict[str, torch.Tensor]] = None,  # added by Chunting
+        step=0,
     ):
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
@@ -289,20 +294,39 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_id=None):
         super().__init__()
+        self.config = config
+
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(config)
+        self.attn = GPT2Attention(config, False, cache_key='self', layer_id=layer_id)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
-            self.crossattention = GPT2Attention(config, is_cross_attention=True)
+            self.crossattention = GPT2Attention(config, is_cross_attention=True, cache_key='encoder_decoder', layer_id=layer_id)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPT2MLP(inner_dim, config)
+
+        if config.ffn_mode == 'adapter':
+            # import pdb; pdb.set_trace()
+            # self.ef_ffn_adapter = Adapter_Layer(self.config,
+            #                                     dropout=self.dropout,
+            #                                     bottleneck=config.ffn_bn,
+            #                                     init_option=config.ffn_adapter_init_option,
+            #                                     adapter_scalar=config.ffn_adapter_scalar,
+            #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+            #                                     )
+            self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.ffn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=config.ffn_adapter_scalar,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=config.lp_num)
 
     def forward(
         self,
@@ -314,8 +338,10 @@ class GPT2Block(nn.Module):
         encoder_attention_mask=None,
         use_cache=False,
         output_attentions=False,
-        return_hidden_type=None, # added by Junxian along with the arguments below
-        override=None,
+        prefix_state=None,
+        decoder_layer_idx=-1,
+        p_prime=None,
+        annos=None,
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
@@ -332,7 +358,7 @@ class GPT2Block(nn.Module):
         # residual connection
         hidden_states = attn_output + residual
 
-        if encoder_hidden_states is not None:
+        if encoder_hidden_states is not None:   # NOTE by Zian: if not incurring bugs, ignore cross attention code (not used)
             # add one self-attention block for cross-attention
             if not hasattr(self, "crossattention"):
                 raise ValueError(
@@ -354,32 +380,29 @@ class GPT2Block(nn.Module):
             hidden_states = residual + attn_output
             outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
 
+        if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
+            # import pdb; pdb.set_trace()
+            adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+
+
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-
-        if override['type'] == 'ffn_input_after_ln':
-            hidden_states = override_func(hidden_states, override)
-
-        # added by Junxian
-        # this is the embeddings used to represent context by
-        # knnlm
-        extra_hidden = None
-        if return_hidden_type == 'ffn_input_after_ln':
-            extra_hidden = hidden_states
-        else:
-            extra_hidden = None
-
         feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
+
+        if 'adapter' in self.config.ffn_mode:
+            if self.config.ffn_option == 'sequential':
+                hidden_states = self.ef_ffn_adapter(hidden_states, annos)
+            elif self.config.ffn_option == 'parallel':
+                hidden_states =  hidden_states + adapter_change
+            else:
+                raise ValueError
 
         if use_cache:
             outputs = (hidden_states,) + outputs
         else:
             outputs = (hidden_states,) + outputs[1:]
-
-        # added by Junxian
-        outputs = outputs + (extra_hidden, )
 
         return outputs  # hidden_states, present, (attentions, cross_attentions)
 
@@ -601,7 +624,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([GPT2Block(config, layer_id=ii) for ii in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.init_weights()
@@ -678,9 +701,15 @@ class GPT2Model(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        return_hidden_type=None, # Added by Junxian
-        override=None, # Added by Junxian
+        prefix_state=None,
+        p_prime=None,
+        annos=None,
     ):
+
+        if self.config.attn_mode == 'dlisa' and prefix_state is not None and hasattr(prefix_state, 'biases') and prefix_state.biases is not None:
+            prefix_state = prefix_state.biases
+
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -718,7 +747,8 @@ class GPT2Model(GPT2PreTrainedModel):
 
         # GPT2Attention mask.
         if attention_mask is not None:
-            assert batch_size > 0, "batch_size has to be defined and > 0"
+            if batch_size <= 0:
+                raise ValueError("batch_size has to be defined and > 0")
             attention_mask = attention_mask.view(batch_size, -1)
             # We create a 3D attention mask from a 2D tensor mask.
             # Sizes are [batch_size, 1, 1, to_seq_length]
@@ -769,21 +799,7 @@ class GPT2Model(GPT2PreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-
-        # added by Junxian
-        if override is not None:
-            layer_override = override['layer'] if override['layer'] >=0 \
-                        else len(self.h) + override['layer']
-        else:
-            layer_override = None
-
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-            # by Junxian
-            # only override in the corresponding layer
-            if layer_override is not None and i == layer_override:
-                override_sub = override
-            else:
-                override_sub = None
 
             # Model parallel
             if self.model_parallel:
@@ -796,14 +812,8 @@ class GPT2Model(GPT2PreTrainedModel):
                     attention_mask = attention_mask.to(hidden_states.device)
                 if isinstance(head_mask, torch.Tensor):
                     head_mask = head_mask.to(hidden_states.device)
-
-            # if output_hidden_states:
-            #     all_hidden_states = all_hidden_states + (hidden_states,)
             if output_hidden_states:
-                if (return_hidden_type is None or return_hidden_type == 'default') or i == 0:
-                    all_hidden_states = all_hidden_states + (hidden_states,)
-                else:
-                    all_hidden_states = all_hidden_states + (outputs[-1], )
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
             if getattr(self.config, "gradient_checkpointing", False) and self.training:
 
@@ -831,6 +841,13 @@ class GPT2Model(GPT2PreTrainedModel):
                     encoder_attention_mask,
                 )
             else:
+                # print("before prefix is none: {}, idx = {}".format(prefix_state is None, idx))
+                if prefix_state is not None:
+                    pass_prefix_state = prefix_state[i] if isinstance(prefix_state, list) else prefix_state
+                else:
+                    pass_prefix_state = None
+                # print("after prefix is none: {}, idx = {}".format(pass_prefix_state, idx))
+
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
@@ -840,18 +857,13 @@ class GPT2Model(GPT2PreTrainedModel):
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                    return_hidden_type=return_hidden_type,
-                    override=override_sub,
+                    prefix_state=pass_prefix_state,
+                    decoder_layer_idx=i,
+                    p_prime=p_prime,
+                    annos=annos,
                 )
 
-
             hidden_states = outputs[0]
-
-            # check if i != len(self.h) - 1 because for the last layer, hidden states should be overridden 
-            # after layer norm
-            if override_sub is not None and override_sub['type'] == 'standard' and i != len(self.h) - 1:
-                hidden_states = override_func(hidden_states, override_sub)
-
             if use_cache is True:
                 presents = presents + (outputs[1],)
 
@@ -866,23 +878,19 @@ class GPT2Model(GPT2PreTrainedModel):
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
-
         hidden_states = self.ln_f(hidden_states)
 
-        if override is not None and override['type'] == 'standard' and layer_override == len(self.h) - 1:
-            hidden_states = override_func(hidden_states, override_sub)
-
-        # import pdb; pdb.set_trace()
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
         if output_hidden_states:
-            if return_hidden_type is None or return_hidden_type == 'default':
-                all_hidden_states = all_hidden_states + (hidden_states,)
-            else:
-                all_hidden_states = all_hidden_states + (outputs[-1],)
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+            return tuple(
+                v
+                for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+                if v is not None
+            )
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -900,7 +908,7 @@ class GPT2Model(GPT2PreTrainedModel):
     """,
     GPT2_START_DOCSTRING,
 )
-class GPT2LMHeadModel(GPT2PreTrainedModel):
+class GPT2LMHeadModel(GPT2PreTrainedModel):  # NOTE by Zian: only this class is used (temporarily)
     _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
 
     def __init__(self, config):
@@ -959,6 +967,18 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
+
+        p_prime = None
+
+        assert attention_mask is not None
+        if self.config.attn_mode == "prompt_tuning":    # FIXME: if there is any bug
+            attention_mask = torch.cat(
+                [torch.ones(input_ids.size(0), self.config.attn_bn).to(input_ids.device), attention_mask], dim=1)
+
+        # print("generate")
+        # logger.info(kwargs["prefix_state"].biases[6]["self"]["prev_key"][:2])
+        # input()
+
         return {
             "input_ids": input_ids,
             "past_key_values": past,
@@ -966,6 +986,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             "position_ids": position_ids,
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids,
+            "prefix_state": kwargs["prefix_state"] if "prefix_state" in kwargs else None,
+            "p_prime": p_prime,
         }
 
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
@@ -991,8 +1013,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        return_hidden_type=None, # added by Junxian
-        override=None,
+        prefix_state=None,
+        p_prime=None,
+        annos=None,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1016,8 +1039,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            return_hidden_type=return_hidden_type, # added by Junxian
-            override=override,
+            prefix_state=prefix_state,
+            p_prime=p_prime,
+            annos=annos,
         )
         hidden_states = transformer_outputs[0]
 
@@ -1387,6 +1411,108 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
             loss=loss,
             logits=pooled_logits,
             past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+
+@add_start_docstrings(
+    """
+    GPT2 Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g. for
+    Named-Entity-Recognition (NER) tasks.
+    """,
+    GPT2_START_DOCSTRING,
+)
+class GPT2ForTokenClassification(GPT2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+
+        self.transformer = GPT2Model(config)
+        if hasattr(config, "classifier_dropout") and config.classifier_dropout is not None:
+            classifier_dropout = config.classifier_dropout
+        elif hasattr(config, "hidden_dropout") and config.hidden_dropout is not None:
+            classifier_dropout = config.hidden_dropout
+        else:
+            classifier_dropout = 0.1
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.init_weights()
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
+    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_code_sample_docstrings(
+        tokenizer_class=_TOKENIZER_FOR_DOC,
+        checkpoint="microsoft/DialogRPT-updown",
+        output_type=TokenClassifierOutput,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def forward(
+        self,
+        input_ids=None,
+        past_key_values=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        r"""
+        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
+            Labels for computing the sequence classification/regression loss. Indices should be in :obj:`[0, ...,
+            config.num_labels - 1]`. If :obj:`config.num_labels == 1` a regression loss is computed (Mean-Square loss),
+            If :obj:`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.transformer(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = transformer_outputs[0]
+        hidden_states = self.dropout(hidden_states)
+        logits = self.classifier(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            # Only keep active parts of the loss
+            if attention_mask is not None:
+                active_loss = attention_mask.view(-1) == 1
+                active_logits = logits.view(-1, self.num_labels)
+                active_labels = torch.where(
+                    active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
+                )
+                loss = loss_fct(active_logits, active_labels)
+            else:
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + transformer_outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TokenClassifierOutput(
+            loss=loss,
+            logits=logits,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )

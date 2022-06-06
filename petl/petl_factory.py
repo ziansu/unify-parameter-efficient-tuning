@@ -456,6 +456,149 @@ class Adapter_Layer(nn.Module):
         return output
 
 
+class MixAdapter_Layer(nn.Module):
+    """
+    Mixing global and local adapters together (1 global and `lp_num` local adapters).
+    
+    GPT2 specific module.
+
+    TODO: accelerate computation (decomposition or composition)
+
+    current setting: all local adapters and 
+    """
+    def __init__(self,
+                 config=None,
+                 d_model=None,
+                 bottleneck=None,
+                 dropout=0.0,
+                 init_option="bert",
+                 adapter_scalar="1.0",
+                 adapter_layernorm_option="in",
+                 lp_num=7):
+        super().__init__()
+        self.n_embd = config.n_embd if d_model is None else d_model
+        self.down_size = config.attn_bn if bottleneck is None else bottleneck
+        # self.non_linearity = args.non_linearity  # use ReLU by default
+        self.lp_num = lp_num
+
+        #_before
+        self.adapter_layernorm_option = adapter_layernorm_option
+
+        self.adapter_layer_norm_before = None
+        if adapter_layernorm_option == "in" or adapter_layernorm_option == "out":
+            self.adapter_layer_norm_before = nn.LayerNorm(self.n_embd)
+
+        if adapter_scalar == "learnable_scalar":
+            self.scale = nn.Parameter(torch.ones(1))
+        else:
+            self.scale = float(adapter_scalar)
+
+        # NOTE: sequential version
+        # self.down_proj = nn.Linear(self.n_embd, self.down_size)
+        # self.non_linear_func = nn.ReLU()
+        # self.up_proj = nn.Linear(self.down_size, self.n_embd)
+
+        # self.l_down_proj = nn.ModuleList([nn.Linear(self.n_embd, self.down_size) for _ in range(self.lp_num)])
+        # self.l_up_proj = nn.ModuleList([nn.Linear(self.down_size, self.n_embd) for _ in range(self.lp_num)])
+
+        # NOTE: parallel version
+        # ref: https://stackoverflow.com/questions/58374980/run-multiple-models-of-an-ensemble-in-parallel-with-pytorch
+        self.down_proj = nn.Linear(self.n_embd, self.down_size * (self.lp_num + 1))
+        # self.down_proj = nn.Conv1d(in_channels=self.n_embd * (self.lp_num + 1), 
+        #                            out_channels=self.down_size * (self.lp_num + 1), 
+        #                            kernel_size=1, 
+        #                            groups=self.lp_num + 1)
+        self.non_linear_func = nn.ReLU()
+        self.up_proj = nn.Conv1d(in_channels=self.down_size * (self.lp_num + 1), 
+                                 out_channels=self.n_embd * (self.lp_num + 1), 
+                                 kernel_size=1, 
+                                 groups=self.lp_num + 1)
+
+        self.dropout = dropout
+        if init_option == "bert":   # NOTE by Zian: assume bert init right now
+            self.apply(init_bert_weights)
+        elif init_option == "lora":
+            with torch.no_grad():
+                nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj.weight)
+                nn.init.zeros_(self.down_proj.bias)
+                nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, x, anno, add_residual=True, residual=None):
+        """
+        
+        """
+        if type(anno) == tuple:  # debug
+            anno_prime = anno[1]
+            anno = anno[0]
+            flag = True
+        else:
+            flag = False
+
+        residual = x if residual is None else residual
+        if self.adapter_layernorm_option == 'in':
+            x = self.adapter_layer_norm_before(x)
+
+        # down = self.down_proj(x)
+        # down = self.non_linear_func(down)
+        # down = nn.functional.dropout(down, p=self.dropout, training=self.training)
+        # up = self.up_proj(down)
+
+        # up = up * self.scale
+
+        # # local projection (TODO: parallelize)
+        # down_l = [self.l_down_proj[i](x) for i in range(self.lp_num)]
+        # down_l = [self.non_linear_func(x) for x in down_l]
+        # down_l = [nn.functional.dropout(x, p=self.dropout, training=self.training) for x in down_l]
+        # up_l = [self.l_up_proj[i](down_l[i]) for i in range(self.lp_num)]
+
+        # # aggregation (to be studied)
+        # up_l = [up_ll.masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0) for i, up_ll in enumerate(up_l)]
+        # up_l_agg = torch.stack(up_l).sum(dim=0)
+        # # print(up_l_agg.size())
+        
+        # up_l_agg = up_l_agg * self.scale
+        # up = up + up_l_agg
+
+        down = self.down_proj(x)
+        down = self.non_linear_func(down)
+        down = nn.functional.dropout(down, p=self.dropout, training=self.training)
+        up = self.up_proj(down.permute(0, 2, 1))       
+        up = up.permute(0, 2, 1).view(x.shape[0], x.shape[1], self.lp_num + 1, self.n_embd)
+
+        if flag:
+            print('lp_num:', self.lp_num)
+            up_prime = up.clone()
+
+        for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
+            # up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0)
+            up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno!=i)[:,:,None].expand(x.size()), 0.0)
+        
+        # debug
+        if flag:
+            for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
+                # up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0)
+                up_prime[:,:,i,:] = up_prime[:,:,i,:].masked_fill_((anno_prime!=i)[:,:,None].expand(x.size()), 0.0)
+            print(up == up_prime)
+            print(up)
+            # print(up_prime)
+            exit()
+
+        up = torch.sum(up, dim=2)
+        up = up * self.scale
+
+
+        if self.adapter_layernorm_option == 'out':
+            up = self.adapter_layer_norm_before(up)
+
+        if add_residual:
+            output = up + residual
+        else:
+            output = up
+
+        return output
+
+
 def softmax_gating(logits_1, logits_2):
     # the last two dimensions of logits is (T, S)
     max_logits = torch.max(torch.cat([logits_1, logits_2], dim=-1), dim=-1, keepdim=True)[0]
