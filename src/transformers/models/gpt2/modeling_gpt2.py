@@ -53,7 +53,7 @@ from .configuration_gpt2 import GPT2Config
 
 import sys
 sys.path.insert(2, "./")
-from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, AsymMixAdapter_Layer
 
 logger = logging.get_logger(__name__)
 
@@ -320,13 +320,24 @@ class GPT2Block(nn.Module):
             #                                     adapter_scalar=config.ffn_adapter_scalar,
             #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
             #                                     )
-            self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+            if config.lp_dim_ratio:
+                self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
                                                 dropout=0.0,
                                                 bottleneck=config.ffn_bn,
                                                 init_option=config.ffn_adapter_init_option,
                                                 adapter_scalar=config.ffn_adapter_scalar,
                                                 adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                lp_num=config.lp_num)
+                                                lp_num=7,
+                                                lp_dim_ratio=config.lp_dim_ratio)
+            else:
+                self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.ffn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=config.ffn_adapter_scalar,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=7)
+                                                # lp_num=config.lp_num)
 
     def forward(
         self,

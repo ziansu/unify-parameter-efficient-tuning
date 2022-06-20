@@ -461,10 +461,6 @@ class MixAdapter_Layer(nn.Module):
     Mixing global and local adapters together (1 global and `lp_num` local adapters).
     
     GPT2 specific module.
-
-    TODO: accelerate computation (decomposition or composition)
-
-    current setting: all local adapters and 
     """
     def __init__(self,
                  config=None,
@@ -578,6 +574,120 @@ class MixAdapter_Layer(nn.Module):
         if flag:
             for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
                 # up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0)
+                up_prime[:,:,i,:] = up_prime[:,:,i,:].masked_fill_((anno_prime!=i)[:,:,None].expand(x.size()), 0.0)
+            print(up == up_prime)
+            print(up)
+            # print(up_prime)
+            exit()
+
+        up = torch.sum(up, dim=2)
+        up = up * self.scale
+
+
+        if self.adapter_layernorm_option == 'out':
+            up = self.adapter_layer_norm_before(up)
+
+        if add_residual:
+            output = up + residual
+        else:
+            output = up
+
+        return output
+
+
+class AsymMixAdapter_Layer(nn.Module):
+    """
+    Asymmetric version of mix adapter
+
+    :lp_dim_ratio: local_down_size / down_size
+    """
+    def __init__(self,
+                 config=None,
+                 d_model=None,
+                 bottleneck=None,
+                 dropout=0.0,
+                 init_option="bert",
+                 adapter_scalar="1.0",
+                 adapter_layernorm_option="in",
+                 lp_num=7,
+                 lp_dim_ratio=1.0):
+        super().__init__()
+        self.n_embd = config.n_embd if d_model is None else d_model
+        self.down_size = config.attn_bn if bottleneck is None else bottleneck
+        # self.non_linearity = args.non_linearity  # use ReLU by default
+        self.lp_num = lp_num
+        self.local_down_size = int(lp_dim_ratio * self.down_size)
+        assert self.down_size * lp_dim_ratio == self.local_down_size
+
+        #_before
+        self.adapter_layernorm_option = adapter_layernorm_option
+
+        self.adapter_layer_norm_before = None
+        if adapter_layernorm_option == "in" or adapter_layernorm_option == "out":
+            self.adapter_layer_norm_before = nn.LayerNorm(self.n_embd)
+
+        if adapter_scalar == "learnable_scalar":
+            self.scale = nn.Parameter(torch.ones(1))
+        else:
+            self.scale = float(adapter_scalar)
+        
+        self.down_proj = nn.Linear(self.n_embd, self.down_size + self.local_down_size * self.lp_num)
+        self.non_linear_func = nn.ReLU()
+        self.up_proj_g = nn.Conv1d(in_channels=self.down_size, 
+                                 out_channels=self.n_embd, 
+                                 kernel_size=1)
+        self.up_proj_l = nn.Conv1d(in_channels=self.local_down_size * self.lp_num,
+                                 out_channels=self.n_embd * self.lp_num, 
+                                 kernel_size=1, 
+                                 groups=self.lp_num)
+
+        self.dropout = dropout
+        if init_option == "bert":   # NOTE by Zian: assume bert init right now
+            self.apply(init_bert_weights)
+        elif init_option == "lora":
+            with torch.no_grad():
+                nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj_g.weight)
+                nn.init.zeros_(self.up_proj_l.weight)
+                nn.init.zeros_(self.down_proj.bias)
+                nn.init.zeros_(self.up_proj_g.bias)
+                nn.init.zeros_(self.up_proj_l.bias)
+
+    def forward(self, x, anno, add_residual=True, residual=None):
+        """
+        
+        """
+        if type(anno) == tuple:  # debug
+            anno_prime = anno[1]
+            anno = anno[0]
+            flag = True
+        else:
+            flag = False
+
+        residual = x if residual is None else residual
+        if self.adapter_layernorm_option == 'in':
+            x = self.adapter_layer_norm_before(x)
+
+        down = self.down_proj(x)
+        down = self.non_linear_func(down)
+        down = nn.functional.dropout(down, p=self.dropout, training=self.training)
+        down = down.permute(0, 2, 1)
+        down_g, down_l = down[:, -self.down_size:, :], down[:, :self.lp_num * self.local_down_size, :]
+        up_g = self.up_proj_g(down_g)
+        up_l = self.up_proj_l(down_l)
+        up = torch.cat((up_l, up_g), dim=1)  # NOTE: local first
+        up = up.permute(0, 2, 1).view(x.shape[0], x.shape[1], self.lp_num + 1, self.n_embd)
+
+        if flag:
+            print('lp_num:', self.lp_num)
+            up_prime = up.clone()
+
+        for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
+            up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno!=i)[:,:,None].expand(x.size()), 0.0)
+        
+        # debug
+        if flag:
+            for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
                 up_prime[:,:,i,:] = up_prime[:,:,i,:].masked_fill_((anno_prime!=i)[:,:,None].expand(x.size()), 0.0)
             print(up == up_prime)
             print(up)
