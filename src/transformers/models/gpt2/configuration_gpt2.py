@@ -128,6 +128,7 @@ class GPT2Config(PretrainedConfig):
 
     def __init__(
         self,
+        # d_model=768, #added by yy
         vocab_size=50257,
         n_positions=1024,
         n_ctx=1024,
@@ -155,6 +156,7 @@ class GPT2Config(PretrainedConfig):
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
+        # self.d_model = d_model #added by yy
         self.vocab_size = vocab_size
         self.n_ctx = n_ctx
         self.n_positions = n_positions

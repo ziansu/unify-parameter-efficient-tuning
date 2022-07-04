@@ -53,7 +53,7 @@ from .configuration_gpt2 import GPT2Config
 
 import sys
 sys.path.insert(2, "./")
-from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, LoRAConv1D
 
 logger = logging.get_logger(__name__)
 
@@ -153,11 +153,22 @@ class GPT2Attention(nn.Module):
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
 
-        if self.is_cross_attention:
-            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
-            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+        if config.attn_mode == "lora":
+            if self.is_cross_attention:
+                self.c_attn = LoRAConv1D(2 * self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+                self.q_attn = LoRAConv1D(self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+            else:
+                self.c_attn = LoRAConv1D(3 * self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
         else:
-            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+            if self.is_cross_attention:
+                self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+                self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+            else:
+                self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
@@ -313,20 +324,20 @@ class GPT2Block(nn.Module):
 
         if config.ffn_mode == 'adapter':
             # import pdb; pdb.set_trace()
-            # self.ef_ffn_adapter = Adapter_Layer(self.config,
-            #                                     dropout=self.dropout,
-            #                                     bottleneck=config.ffn_bn,
-            #                                     init_option=config.ffn_adapter_init_option,
-            #                                     adapter_scalar=config.ffn_adapter_scalar,
-            #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-            #                                     )
-            self.ef_ffn_adapter = MixAdapter_Layer(self.config,
-                                                dropout=0.0,
+            self.ef_ffn_adapter = Adapter_Layer(self.config,
+                                                #dropout=self.dropout,
                                                 bottleneck=config.ffn_bn,
                                                 init_option=config.ffn_adapter_init_option,
                                                 adapter_scalar=config.ffn_adapter_scalar,
                                                 adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                lp_num=config.lp_num)
+                                                )
+            # self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+            #                                     dropout=0.0,
+            #                                     bottleneck=config.ffn_bn,
+            #                                     init_option=config.ffn_adapter_init_option,
+            #                                     adapter_scalar=config.ffn_adapter_scalar,
+            #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+            #                                     lp_num=config.lp_num)
 
     def forward(
         self,
@@ -382,7 +393,8 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
             # import pdb; pdb.set_trace()
-            adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            #adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            adapter_change = self.ef_ffn_adapter(hidden_states,add_residual=False) #changed by yy
 
 
         residual = hidden_states

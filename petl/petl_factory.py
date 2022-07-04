@@ -403,7 +403,7 @@ class Adapter_Layer(nn.Module):
                  adapter_scalar="1.0",
                  adapter_layernorm_option="in"):
         super().__init__()
-        self.n_embd = config.d_model if d_model is None else d_model
+        self.n_embd = config.n_embd if d_model is None else d_model
         self.down_size = config.attn_bn if bottleneck is None else bottleneck
         # self.non_linearity = args.non_linearity  # use ReLU by default
 
@@ -447,6 +447,8 @@ class Adapter_Layer(nn.Module):
 
         if self.adapter_layernorm_option == 'out':
             up = self.adapter_layer_norm_before(up)
+
+        # print(add_residual) # added by yy
 
         if add_residual:
             output = up + residual
@@ -738,3 +740,113 @@ class Linear(nn.Linear, LoRALayer):
             return result
         else:
             return F.linear(x, T(self.weight), bias=self.bias)
+
+
+class Conv1D(nn.Module):
+    """
+    1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
+
+    Basically works like a linear layer but the weights are transposed.
+
+    Args:
+        nf (:obj:`int`): The number of output features.
+        nx (:obj:`int`): The number of input features.
+    """
+
+    def __init__(self, nf, nx):
+        super().__init__()
+        self.nf = nf
+        w = torch.empty(nx, nf)
+        nn.init.normal_(w, std=0.02)
+        self.weight = nn.Parameter(w)
+        self.bias = nn.Parameter(torch.zeros(nf))
+
+    def forward(self, x):
+        size_out = x.size()[:-1] + (self.nf,)
+        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        x = x.view(*size_out)
+        return x
+
+
+def my_conv1d(x,weight,bias):
+    size_out = x.size()[:-1]+(weight.size(-1),)
+    x = torch.addmm(bias,x.view(-1,x.size(-1)),weight)
+    x = x.view(*size_out)
+    return x
+
+class LoRAConv1D(Conv1D, LoRALayer):
+    # LoRA implemented in a dense layer
+    def __init__(
+            self,
+            out_features: int,
+            in_features: int,
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.,
+            fan_in_fan_out: bool = False,
+            # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+            merge_weights: bool = True,
+            lora_init: str="lora",
+            **kwargs
+    ):
+        Conv1D.__init__(self, out_features, in_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.lora_init = lora_init
+        self.fan_in_fan_out = fan_in_fan_out
+        # Actual trainable parameters
+        if r > 0:
+            self.ef_lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))
+            self.ef_lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
+            self.scaling = self.lora_alpha / self.r
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.T
+
+    def reset_parameters(self):
+        nn.Conv1d.reset_parameters(self)
+        if hasattr(self, 'ef_lora_A'):
+            if self.lora_init == "bert":
+                nn.init.normal_(self.ef_lora_A, std=0.02)
+                nn.init.normal_(self.ef_lora_B, std=0.02)
+            elif self.lora_init == "lora":
+                # initialize A the same way as the default for nn.Linear and B to zero
+                nn.init.kaiming_uniform_(self.ef_lora_A, a=math.sqrt(5))
+                nn.init.zeros_(self.ef_lora_B)
+
+    def train(self, mode: bool = True):
+        def T(w):
+            return w.T if self.fan_in_fan_out else w
+
+        Conv1D.train(self, mode)
+        if self.merge_weights and self.merged:
+            # Make sure that the weights are not merged
+            if self.r > 0:
+                self.weight.data -= T(self.ef_lora_B @ self.ef_lora_A) * self.scaling
+            self.merged = False
+
+    def eval(self):
+        def T(w):
+            return w.T if self.fan_in_fan_out else w
+
+        Conv1D.eval(self)
+        if self.merge_weights and not self.merged:
+            # Merge the weights and mark it
+            if self.r > 0:
+                self.weight.data += T(self.ef_lora_B @ self.ef_lora_A) * self.scaling
+            self.merged = True
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.T if self.fan_in_fan_out else w
+
+        if self.r > 0 and not self.merged:
+            result = my_conv1d(x, T(self.weight), bias=self.bias)
+            if self.r > 0:
+                result += (self.lora_dropout(x) @ self.ef_lora_A.T @ self.ef_lora_B.T) * self.scaling
+            return result
+        else:
+            return my_conv1d(x, T(self.weight), bias=self.bias)
