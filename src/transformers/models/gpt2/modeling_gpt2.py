@@ -53,7 +53,7 @@ from .configuration_gpt2 import GPT2Config
 
 import sys
 sys.path.insert(2, "./")
-from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, LoRAConv1D
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, LoRAConv1D, LoRA_Adapter
 
 logger = logging.get_logger(__name__)
 
@@ -132,6 +132,7 @@ class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, cache_key: str = None, layer_id=0):
         super().__init__()
 
+        self.config = config
         max_positions = config.max_position_embeddings
         self.register_buffer(
             "bias",
@@ -153,22 +154,36 @@ class GPT2Attention(nn.Module):
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
 
-        if config.attn_mode == "lora":
-            if self.is_cross_attention:
-                self.c_attn = LoRAConv1D(2 * self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
-                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
-                self.q_attn = LoRAConv1D(self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
-                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
-            else:
-                self.c_attn = LoRAConv1D(3 * self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
-                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+        # LoRA version one : the initial LoRA on q,k,v, does not work very well
+        # if config.attn_mode == "lora":
+        #     if self.is_cross_attention:
+        #         self.c_attn = LoRAConv1D(2 * self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+        #                          lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+        #         self.q_attn = LoRAConv1D(self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+        #                          lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+        #     else:
+        #         self.c_attn = LoRAConv1D(3 * self.embed_dim, self.embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+        #                          lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+        # else:
+        if self.is_cross_attention:
+            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
+            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
         else:
-            if self.is_cross_attention:
-                self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
-                self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
-            else:
-                self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
 
+        if config.attn_mode == "lora":
+            self.ef_lora_adapter_q = LoRA_Adapter(self.config,
+                                                bottleneck=config.attn_bn,  # refer to r in LoRA
+                                                init_option=config.ffn_adapter_init_option, # lora init
+                                                adapter_scalar=config.lora_alpha/config.attn_bn, 
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                )
+            self.ef_lora_adapter_v = LoRA_Adapter(self.config,
+                                                bottleneck=config.attn_bn,  # refer to r in LoRA
+                                                init_option=config.ffn_adapter_init_option, # lora init
+                                                adapter_scalar=config.lora_alpha/config.attn_bn, 
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                )
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
@@ -259,6 +274,10 @@ class GPT2Attention(nn.Module):
             attention_mask = encoder_attention_mask
         else:
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+
+        if self.config.attn_mode == "lora":
+            query = self.ef_lora_adapter_q(query)
+            value = self.ef_lora_adapter_v(value)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
