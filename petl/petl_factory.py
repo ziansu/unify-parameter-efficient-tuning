@@ -566,7 +566,7 @@ class MixAdapter_Layer(nn.Module):
             print('lp_num:', self.lp_num)
             up_prime = up.clone()
 
-        for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
+        for i in range(1, self.lp_num+1):  # first `self.lp_num` states are local states, the last is the global state
             # up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0)
             up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno!=i)[:,:,None].expand(x.size()), 0.0)
         
@@ -579,7 +579,9 @@ class MixAdapter_Layer(nn.Module):
             print(up)
             # print(up_prime)
             exit()
-
+        glo = up[:,:,-1,:].squeeze()
+        local = torch.sum(up[:,:,:-1,:],dim=2)
+        cos = torch.maximum(torch.mean(F.cosine_similarity(glo, local, dim=-1, eps=1e-08)),torch.tensor(0))
         up = torch.sum(up, dim=2)
         up = up * self.scale
 
@@ -592,7 +594,7 @@ class MixAdapter_Layer(nn.Module):
         else:
             output = up
 
-        return output
+        return output,cos
 
 
 class AsymMixAdapter_Layer(nn.Module):

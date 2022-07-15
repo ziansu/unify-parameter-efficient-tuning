@@ -131,7 +131,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, cache_key: str = None, layer_id=0):
         super().__init__()
-
+        self.config = config
         max_positions = config.max_position_embeddings
         self.register_buffer(
             "bias",
@@ -160,6 +160,15 @@ class GPT2Attention(nn.Module):
             self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
+        if config.attn_mode == "lora":
+            self.ef_lora_mix = MixAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.attn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=2.0,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=7)
+        
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
@@ -235,6 +244,7 @@ class GPT2Attention(nn.Module):
         output_attentions=False,
         prefix_state: Optional[Dict[str, torch.Tensor]] = None,  # added by Chunting
         step=0,
+        annos=None,
     ):
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
@@ -248,6 +258,9 @@ class GPT2Attention(nn.Module):
             attention_mask = encoder_attention_mask
         else:
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+
+        if self.config.attn_mode == "lora":
+            query = self.ef_lora_mix(query,annos)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
@@ -320,7 +333,7 @@ class GPT2Block(nn.Module):
             #                                     adapter_scalar=config.ffn_adapter_scalar,
             #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
             #                                     )
-            if config.lp_dim_ratio:
+            if 0:
                 self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
                                                 dropout=0.0,
                                                 bottleneck=config.ffn_bn,
@@ -363,6 +376,7 @@ class GPT2Block(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            annos=annos
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -393,7 +407,7 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
             # import pdb; pdb.set_trace()
-            adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            adapter_change,cos_loss = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
 
 
         residual = hidden_states
@@ -404,7 +418,7 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode:
             if self.config.ffn_option == 'sequential':
-                hidden_states = self.ef_ffn_adapter(hidden_states, annos)
+                hidden_states,cos_loss = self.ef_ffn_adapter(hidden_states, annos)
             elif self.config.ffn_option == 'parallel':
                 hidden_states =  hidden_states + adapter_change
             else:
@@ -415,7 +429,7 @@ class GPT2Block(nn.Module):
         else:
             outputs = (hidden_states,) + outputs[1:]
 
-        return outputs  # hidden_states, present, (attentions, cross_attentions)
+        return outputs,cos_loss  # hidden_states, present, (attentions, cross_attentions)
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -859,7 +873,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     pass_prefix_state = None
                 # print("after prefix is none: {}, idx = {}".format(pass_prefix_state, idx))
 
-                outputs = block(
+                outputs,cos_loss = block(
                     hidden_states,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
@@ -909,7 +923,7 @@ class GPT2Model(GPT2PreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
-        )
+        ), cos_loss
 
 
 @add_start_docstrings(
@@ -1036,7 +1050,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):  # NOTE by Zian: only this class is 
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        transformer_outputs = self.transformer(
+        transformer_outputs, cos_loss = self.transformer(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -1070,7 +1084,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):  # NOTE by Zian: only this class is 
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            # loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)) + 0.2 * cos_loss # should be set as a hyper
 
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
