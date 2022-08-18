@@ -578,12 +578,7 @@ class MixAdapter_Layer(nn.Module):
             print('lp_num:', self.lp_num)
             up_prime = up.clone()
 
-<<<<<<< HEAD
-        for i in range(1, self.lp_num+1):  # first `self.lp_num` states are local states, the last is the global state
-=======
-        # for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
-        for i in range(1, self.lp_num+1):  # first global
->>>>>>> cf0fd479c7520a54b5bc61a110b5b8a474ed412a
+        for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
             # up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0)
             up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno!=i)[:,:,None].expand(x.size()), 0.0)
         
