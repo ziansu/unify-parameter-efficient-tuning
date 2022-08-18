@@ -53,7 +53,7 @@ from .configuration_gpt2 import GPT2Config
 
 import sys
 sys.path.insert(2, "./")
-from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, AsymMixAdapter_Layer
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, AsymMixAdapter_Layer, LoRA_Adapter
 
 logger = logging.get_logger(__name__)
 
@@ -131,8 +131,16 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, cache_key: str = None, layer_id=0):
         super().__init__()
-
+        self.config = config
         max_positions = config.max_position_embeddings
+        if config.attn_mode == "prefix" or config.attn_mode == "mam":
+            self.register_buffer(
+            "bias_prefix",
+            torch.tril(torch.ones((max_positions+config.attn_bn, max_positions+config.attn_bn), dtype=torch.uint8)).view(
+                1, 1, max_positions+config.attn_bn, max_positions+config.attn_bn
+            ),
+        )
+        
         self.register_buffer(
             "bias",
             torch.tril(torch.ones((max_positions, max_positions), dtype=torch.uint8)).view(
@@ -159,6 +167,39 @@ class GPT2Attention(nn.Module):
         else:
             self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+
+        assert cache_key in ['self', 'encoder_decoder', 'encoder']
+        self.cache_key = cache_key
+
+        if config.attn_mode == "lora":
+            self.ef_lora_mix = MixAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.attn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=2.0,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=7)
+        
+        if config.attn_mode == "lora_raw" or config.attn_mode == "mam":
+            self.ef_lora_adapter_q = LoRA_Adapter(self.config,
+                                                bottleneck=config.attn_bn,  # refer to r in LoRA
+                                                init_option=config.ffn_adapter_init_option, # lora init
+                                                adapter_scalar=config.lora_alpha/config.attn_bn, 
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                )
+            self.ef_lora_adapter_v = LoRA_Adapter(self.config,
+                                                bottleneck=config.attn_bn,  # refer to r in LoRA
+                                                init_option=config.ffn_adapter_init_option, # lora init
+                                                adapter_scalar=config.lora_alpha/config.attn_bn, 
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                )
+        
+        if self.config.attn_mode == "adapter" and self.config.attn_option == "sequential":
+            self.ef_attn_adapter = Adapter_Layer(self.config,
+                                                    dropout=0.0,
+                                                    bottleneck=self.config.attn_bn,
+                                                    adapter_layernorm_option="in",
+                                                    )
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -189,7 +230,12 @@ class GPT2Attention(nn.Module):
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
             query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
+            #print(query_length,key_length)
+            if self.config.attn_mode == "prefix" or self.config.attn_mode == "mam":
+                causal_mask = self.bias_prefix[:, :, key_length - query_length : key_length, :key_length].bool()
+            else:
+                causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
+            # print(causal_mask.size(),"********************",attn_weights.size())
             attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
 
         if attention_mask is not None:
@@ -235,6 +281,7 @@ class GPT2Attention(nn.Module):
         output_attentions=False,
         prefix_state: Optional[Dict[str, torch.Tensor]] = None,  # added by Chunting
         step=0,
+        annos=None,
     ):
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
@@ -248,6 +295,13 @@ class GPT2Attention(nn.Module):
             attention_mask = encoder_attention_mask
         else:
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+
+        if self.config.attn_mode == "lora":
+            query = self.ef_lora_mix(query,annos)
+        
+        if self.config.attn_mode == "lora_raw" or self.config.attn_mode == "mam":
+            query = self.ef_lora_adapter_q(query)
+            value = self.ef_lora_adapter_v(value)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
@@ -263,11 +317,35 @@ class GPT2Attention(nn.Module):
         else:
             present = None
 
+        #print(attention_mask,"attention_mask")
+        if prefix_state is not None and (self.config.attn_mode=="prefix" or self.config.attn_mode == "mam"):
+            # legacy
+            prefix_key = prefix_state.get(self.cache_key)['prev_key']  # bsz x nhead, attn_bn, head_dim
+            prefix_value = prefix_state.get(self.cache_key)['prev_value']
+            prefix_mask = prefix_state.get(self.cache_key)['prev_key_padding_mask']  # bsz, attn_bn: zeros
+            # import pdb; pdb.set_trace()
+            if self.config.attn_option == 'concat':
+                # add with adapter
+                # original lisa prefix-tuning
+                # print(prefix_key.view(key.size(0),key.size(1),-1,key.size(3)).size(),key.size())  4*12*200*64,4*12*1024*64
+                key = torch.cat([prefix_key.view(key.size(0),key.size(1),-1,key.size(3)), key], dim=2)
+                value = torch.cat([prefix_value.view(value.size(0),value.size(1),-1,value.size(3)), value], dim=2)
+                # if attention_mask is not None:
+                #     expanded_prefix_mask = prefix_mask[:, None, None, :].expand(bsz, 1, tgt_len, prefix_mask.size(1)).to(attention_mask.dtype)
+                #     attention_mask = torch.cat([expanded_prefix_mask, attention_mask], dim=-1)
+        
+        
+
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+
+        # print(attn_output)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
+
+        if self.config.attn_mode == "adapter" and self.config.attn_option == "sequential":
+            attn_output = self.ef_attn_adapter(attn_output, add_residual=True)
 
         outputs = (attn_output, present)
         if output_attentions:
@@ -310,34 +388,35 @@ class GPT2Block(nn.Module):
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPT2MLP(inner_dim, config)
-
         if config.ffn_mode == 'adapter':
             # import pdb; pdb.set_trace()
-            # self.ef_ffn_adapter = Adapter_Layer(self.config,
-            #                                     dropout=self.dropout,
-            #                                     bottleneck=config.ffn_bn,
-            #                                     init_option=config.ffn_adapter_init_option,
-            #                                     adapter_scalar=config.ffn_adapter_scalar,
-            #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-            #                                     )
-            if config.lp_dim_ratio:
-                self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
-                                                dropout=0.0,
-                                                bottleneck=config.ffn_bn,
-                                                init_option=config.ffn_adapter_init_option,
-                                                adapter_scalar=config.ffn_adapter_scalar,
-                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                lp_num=7,
-                                                lp_dim_ratio=config.lp_dim_ratio)
+            if config.attn_mode != "lora":
+                self.ef_ffn_adapter = Adapter_Layer(self.config,
+                                                    dropout=0.0,
+                                                    bottleneck=config.ffn_bn,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    )
             else:
-                self.ef_ffn_adapter = MixAdapter_Layer(self.config,
-                                                dropout=0.0,
-                                                bottleneck=config.ffn_bn,
-                                                init_option=config.ffn_adapter_init_option,
-                                                adapter_scalar=config.ffn_adapter_scalar,
-                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                lp_num=7)
-                                                # lp_num=config.lp_num)
+                if 0:
+                    self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
+                                                    dropout=0.0,
+                                                    bottleneck=config.ffn_bn,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    lp_num=7,
+                                                    lp_dim_ratio=config.lp_dim_ratio)
+                else:
+                    self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+                                                    dropout=0.0,
+                                                    bottleneck=config.ffn_bn,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    lp_num=7)
+                                                    # lp_num=config.lp_num)
 
     def forward(
         self,
@@ -363,6 +442,8 @@ class GPT2Block(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            prefix_state=prefix_state,
+            annos=annos
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -393,7 +474,10 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
             # import pdb; pdb.set_trace()
-            adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            if self.config.attn_mode == "lora":
+                adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            else:
+                adapter_change = self.ef_ffn_adapter(hidden_states, add_residual=False)
 
 
         residual = hidden_states
@@ -404,7 +488,10 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode:
             if self.config.ffn_option == 'sequential':
-                hidden_states = self.ef_ffn_adapter(hidden_states, annos)
+                if self.config.attn_mode == "lora":
+                    hidden_states = self.ef_ffn_adapter(hidden_states, annos)
+                else:
+                    hidden_states = self.ef_ffn_adapter(hidden_states)
             elif self.config.ffn_option == 'parallel':
                 hidden_states =  hidden_states + adapter_change
             else:
@@ -719,7 +806,6 @@ class GPT2Model(GPT2PreTrainedModel):
 
         if self.config.attn_mode == 'dlisa' and prefix_state is not None and hasattr(prefix_state, 'biases') and prefix_state.biases is not None:
             prefix_state = prefix_state.biases
-
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
