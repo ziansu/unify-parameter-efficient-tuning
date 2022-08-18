@@ -52,7 +52,7 @@ from .configuration_roberta import RobertaConfig
 import sys
 sys.path.insert(2, "./")
 
-from petl.petl_factory import Adapter_Layer, softmax_gating, Linear
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, MixAdapter_Layer, AsymMixAdapter_Layer
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "roberta-base"
@@ -566,13 +566,30 @@ class RobertaLayer(nn.Module):
         self.config = config
 
         if config.ffn_mode == 'adapter' and self.config.ffn_option == 'parallel':
-            self.ef_ffn_adapter = Adapter_Layer(d_model=config.hidden_size,
-                                                dropout=config.hidden_dropout_prob,
+            # self.ef_ffn_adapter = Adapter_Layer(d_model=config.hidden_size,
+            #                                     dropout=config.hidden_dropout_prob,
+            #                                     bottleneck=config.ffn_bn,
+            #                                     init_option=config.ffn_adapter_init_option,
+            #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+            #                                     adapter_scalar=config.ffn_adapter_scalar
+            #                                     )
+            if config.lp_dim_ratio:
+                self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
+                                                dropout=0.0,
                                                 bottleneck=config.ffn_bn,
                                                 init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=config.ffn_adapter_scalar,
                                                 adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                adapter_scalar=config.ffn_adapter_scalar
-                                                )
+                                                lp_num=config.lp_num,
+                                                lp_dim_ratio=config.lp_dim_ratio)
+            else:
+                self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.ffn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=config.ffn_adapter_scalar,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=config.lp_num)
 
     def forward(
         self,
@@ -584,6 +601,7 @@ class RobertaLayer(nn.Module):
         past_key_value=None,
         output_attentions=False,
         prefix_state=None,
+        annos=None,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -629,7 +647,7 @@ class RobertaLayer(nn.Module):
             present_key_value = present_key_value + cross_attn_present_key_value
 
         layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output, annos
         )
         outputs = (layer_output,) + outputs
 
@@ -639,9 +657,10 @@ class RobertaLayer(nn.Module):
 
         return outputs
 
-    def feed_forward_chunk(self, attention_output):
+    def feed_forward_chunk(self, attention_output, annos=None):
         if self.config.ffn_mode == 'adapter' and self.config.ffn_option == 'parallel':
-            adapter_change = self.ef_ffn_adapter(attention_output, add_residual=False)
+            # adapter_change = self.ef_ffn_adapter(attention_output, add_residual=False)
+            adapter_change = self.ef_ffn_adapter(attention_output, annos, add_residual=False)
         else:
             adapter_change = None
 
@@ -670,6 +689,7 @@ class RobertaEncoder(nn.Module):
         output_hidden_states=False,
         return_dict=True,
         prefix_state=None,
+        annos=None,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -721,6 +741,7 @@ class RobertaEncoder(nn.Module):
                     past_key_value,
                     output_attentions,
                     prefix_state=prefix_state[i] if isinstance(prefix_state, list) else prefix_state,
+                    annos=annos,
                 )
 
             hidden_states = layer_outputs[0]
@@ -783,7 +804,7 @@ class RobertaPreTrainedModel(PreTrainedModel):
     # Copied from transformers.models.bert.modeling_bert.BertPreTrainedModel._init_weights
     def _init_weights(self, module):
         """Initialize the weights"""
-        print("============================ init weights is called! ====================================")
+        # print("============================ init weights is called! ====================================")
         if isinstance(module, nn.Linear):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
@@ -954,6 +975,7 @@ class RobertaModel(RobertaPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         prefix_state=None,
+        annos=None,
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -1054,6 +1076,7 @@ class RobertaModel(RobertaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             prefix_state=prefix_state,
+            annos=annos,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None

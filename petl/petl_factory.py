@@ -475,7 +475,16 @@ class MixAdapter_Layer(nn.Module):
                  adapter_layernorm_option="in",
                  lp_num=7):
         super().__init__()
-        self.n_embd = config.n_embd if d_model is None else d_model
+
+        if hasattr(config, 'n_embd'):
+            self.n_embd = config.n_embd if d_model is None else d_model
+        elif hasattr(config, 'd_model'):
+            self.n_embd = config.d_model if d_model is None else d_model
+        elif hasattr(config, 'hidden_size'):
+            self.n_embd = config.hidden_size if d_model is None else d_model
+        else:
+            raise NotImplementedError
+            
         self.down_size = config.attn_bn if bottleneck is None else bottleneck
         # self.non_linearity = args.non_linearity  # use ReLU by default
         self.lp_num = lp_num
@@ -569,7 +578,12 @@ class MixAdapter_Layer(nn.Module):
             print('lp_num:', self.lp_num)
             up_prime = up.clone()
 
+<<<<<<< HEAD
         for i in range(1, self.lp_num+1):  # first `self.lp_num` states are local states, the last is the global state
+=======
+        # for i in range(0, self.lp_num):  # first `self.lp_num` states are local states, the last is the global state
+        for i in range(1, self.lp_num+1):  # first global
+>>>>>>> cf0fd479c7520a54b5bc61a110b5b8a474ed412a
             # up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno==i)[:,:,None].expand(x.size()), 0.0)
             up[:,:,i,:] = up[:,:,i,:].masked_fill_((anno!=i)[:,:,None].expand(x.size()), 0.0)
         
