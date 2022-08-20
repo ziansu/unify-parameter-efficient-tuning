@@ -53,7 +53,7 @@ from .configuration_gpt2 import GPT2Config
 
 import sys
 sys.path.insert(2, "./")
-from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, AsymMixAdapter_Layer, LoRA_Adapter
+from petl.petl_factory import Adapter_Layer, softmax_gating, Linear, adapter_func, MixAdapter_Layer, AsymMixAdapter_Layer, LoRA_Adapter, LocalAdapter_Layer
 
 logger = logging.get_logger(__name__)
 
@@ -200,12 +200,27 @@ class GPT2Attention(nn.Module):
                                                     bottleneck=self.config.attn_bn,
                                                     adapter_layernorm_option="in",
                                                     )
+            # The name "ef_attn_adapter" is used in many branch, but only one will be used during running.
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
         self.pruned_heads = set()
 
+        if 'prefix' in self.config.attn_mode:
+            # "cross_attn" is prefix tuning with vanilla add composation
+            # "cross_attn_relu" is multi-head adapter
+            if self.config.attn_option == 'cross_attn' or self.config.attn_option == 'cross_attn_relu':
+                self.ef_transform_layer_norm = nn.LayerNorm(self.embed_dim)
+
+        if self.config.attn_mode == 'prefix' and self.config.attn_option == "concat" and self.config.mix:
+            self.ef_attn_adapter = LocalAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.attn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=2.0,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=7)
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
@@ -283,6 +298,7 @@ class GPT2Attention(nn.Module):
         step=0,
         annos=None,
     ):
+        bsz, tgt_len, embed_dim = hidden_states.size()
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
                 raise ValueError(
@@ -328,19 +344,61 @@ class GPT2Attention(nn.Module):
                 # add with adapter
                 # original lisa prefix-tuning
                 # print(prefix_key.view(key.size(0),key.size(1),-1,key.size(3)).size(),key.size())  4*12*200*64,4*12*1024*64
-                key = torch.cat([prefix_key.view(key.size(0),key.size(1),-1,key.size(3)), key], dim=2)
-                value = torch.cat([prefix_value.view(value.size(0),value.size(1),-1,value.size(3)), value], dim=2)
+                tmp_shape1 = (key.size(0),key.size(1),-1,key.size(3))
+                tmp_shape2 = (value.size(0),value.size(1),-1,value.size(3))
+                print(tmp_shape1,tmp_shape2,"**********")
+                key = torch.cat([prefix_key.view(*tmp_shape1), key], dim=2)
+                value = torch.cat([prefix_value.view(*tmp_shape2), value], dim=2)
                 # if attention_mask is not None:
                 #     expanded_prefix_mask = prefix_mask[:, None, None, :].expand(bsz, 1, tgt_len, prefix_mask.size(1)).to(attention_mask.dtype)
                 #     attention_mask = torch.cat([expanded_prefix_mask, attention_mask], dim=-1)
         
-        
+            elif self.config.attn_option == "cross_attn" or self.config.attn_option == "cross_attn_noln" \
+                    or self.config.attn_option == "cross_attn_relu":
+                    # optimize an added layernorm
+                if self.config.attn_option == "cross_attn_noln":
+                    cross_query_states = query
+                elif self.config.attn_option == "cross_attn_relu":
+                    cross_hidden = self.ef_transform_layer_norm(hidden_states)
+                    cross_query_states, _, _ = self.c_attn(cross_hidden).split(self.split_size, dim=2)
+                    cross_query_states = self._split_heads(cross_query_states, self.num_heads, self.head_dim)
+                else:
+                    # prefix tuning - gated composation
+                    cross_hidden = self.ef_transform_layer_norm(hidden_states)
+                    cross_query_states, _, _ = self.c_attn(cross_hidden).split(self.split_size, dim=2)
+                    cross_query_states = cross_query_states * (self.head_dim ** -0.5)
+                    cross_query_states = self._split_heads(cross_query_states, self.num_heads, self.head_dim)
+                proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+                cross_query_states = cross_query_states.view(*proj_shape)
+                cross_attn_logits = torch.bmm(cross_query_states, prefix_key.transpose(1, 2))  # no need to add masks, because output is query
+                # bsz * num_heads, tgt_len, prefix_len
+                if self.config.attn_option == "cross_attn_relu":
+                    cross_attn_weights = nn.functional.relu(cross_attn_logits)
+                else:
+                    cross_attn_weights = nn.functional.softmax(cross_attn_logits, dim=-1)
+
+                cross_attn_probs = self.attn_dropout(cross_attn_weights) # changed from nn function
+                cross_attn_output = torch.bmm(cross_attn_probs, prefix_value)
+
+                # when not mimicing the same gating behaviour of prefix tuning
+                if self.config.attn_composition != "gate_add":
+                    cross_attn_output = cross_attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+                    cross_attn_output = cross_attn_output.transpose(1, 2)
+                    cross_attn_output = cross_attn_output.reshape(bsz, tgt_len, embed_dim)
+
+            else:
+                raise ValueError(f"attn_option '{self.config.attn_option}' is invalid")
+
+        if self.config.attn_mode == 'prefix' and self.config.attn_option == "concat" and self.config.mix:
+                cross_attn_output = self.ef_attn_adapter(hidden_states, annos, add_residual=False)
 
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
         # print(attn_output)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
+        if self.config.attn_mode == 'prefix' and self.config.attn_option == "concat" and self.config.mix:
+            attn_output = attn_output * 0.95 + cross_attn_output * 0.05
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
