@@ -172,7 +172,14 @@ class GPT2Attention(nn.Module):
         self.cache_key = cache_key
 
         if config.attn_mode == "lora":
-            self.ef_lora_mix = MixAdapter_Layer(self.config,
+            self.ef_lora_mix_q = MixAdapter_Layer(self.config,
+                                                dropout=0.0,
+                                                bottleneck=config.attn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=2.0,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                lp_num=7)
+            self.ef_lora_mix_v = MixAdapter_Layer(self.config,
                                                 dropout=0.0,
                                                 bottleneck=config.attn_bn,
                                                 init_option=config.ffn_adapter_init_option,
@@ -313,7 +320,8 @@ class GPT2Attention(nn.Module):
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
 
         if self.config.attn_mode == "lora":
-            query = self.ef_lora_mix(query,annos)
+            query = self.ef_lora_mix_q(query,annos)
+            value = self.ef_lora_mix_v(value,annos)
         
         if self.config.attn_mode == "lora_raw" or self.config.attn_mode == "mam":
             query = self.ef_lora_adapter_q(query)
@@ -448,7 +456,7 @@ class GPT2Block(nn.Module):
         self.mlp = GPT2MLP(inner_dim, config)
         if config.ffn_mode == 'adapter':
             # import pdb; pdb.set_trace()
-            if config.attn_mode != "lora":
+            if not config.mix:
                 self.ef_ffn_adapter = Adapter_Layer(self.config,
                                                     dropout=0.0,
                                                     bottleneck=config.ffn_bn,
@@ -457,17 +465,7 @@ class GPT2Block(nn.Module):
                                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
                                                     )
             else:
-                if 0:
-                    self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
-                                                    dropout=0.0,
-                                                    bottleneck=config.ffn_bn,
-                                                    init_option=config.ffn_adapter_init_option,
-                                                    adapter_scalar=config.ffn_adapter_scalar,
-                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                    lp_num=7,
-                                                    lp_dim_ratio=config.lp_dim_ratio)
-                else:
-                    self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+                self.ef_ffn_adapter = MixAdapter_Layer(self.config,
                                                     dropout=0.0,
                                                     bottleneck=config.ffn_bn,
                                                     init_option=config.ffn_adapter_init_option,
@@ -532,7 +530,7 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
             # import pdb; pdb.set_trace()
-            if self.config.attn_mode == "lora":
+            if self.config.mix:
                 adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
             else:
                 adapter_change = self.ef_ffn_adapter(hidden_states, add_residual=False)
