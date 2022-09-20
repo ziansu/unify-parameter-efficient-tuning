@@ -46,6 +46,13 @@ from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_t5 import T5Config
 
 
+import sys
+sys.path.insert(2, "./")
+from petl.petl_factory import Adapter_Layer, \
+                            MixAdapter_Layer, AsymMixAdapter_Layer, FeatureAdapter_Layer, \
+                            softmax_gating, Linear, adapter_func
+from petl.hyper_factory import LayerAnnoController, LightMixAdapter_Layer
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "T5Config"
@@ -281,7 +288,7 @@ class T5DenseGatedGeluDense(nn.Module):
 
 
 class T5LayerFF(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_id=None):
         super().__init__()
         if config.feed_forward_proj == "relu":
             self.DenseReluDense = T5DenseReluDense(config)
@@ -295,15 +302,108 @@ class T5LayerFF(nn.Module):
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
-    def forward(self, hidden_states):
+        self.forward_annos = False
+        self.bn_scaler = 1
+        self.layer_id = layer_id
+        if config.ffn_mode == 'adapter':
+            # import pdb; pdb.set_trace()
+            self.config = config
+            if not config.is_decoder and config.mix:   # encoder has annos when mix
+                self.forward_annos = True
+                if config.mix_n_layers and layer_id >= config.mix_n_layers:
+                    # only mix first n layers (encoder) and the following layers are global
+                    self.forward_annos = False  # TODO: test this part
+                    self.bn_scaler = 2
+            else:
+                self.forward_annos = False  # decoder never forward annos / non-mix encoder
+            
+            if self.forward_annos:
+                if config.enable_hypernet:
+                    logger.warning("Using HyperMixAdapter!")
+                    self.ef_ffn_adapter = LightMixAdapter_Layer(
+                                                    d_model=config.d_model,
+                                                    bottleneck=config.ffn_bn,
+                                                    dropout=0.0,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    n_types=config.lp_num + 1,
+                                                    layer_id=self.layer_id
+                                                )
+
+                elif config.mix_option.startswith('feat_'):
+                    # assert config.mix_option == 'feat_post_add' # temp
+                    logger.warning("Using FeatMixAdapter!")
+                    self.ef_ffn_adapter = FeatureAdapter_Layer(self.config,
+                                                    bottleneck=config.ffn_bn,
+                                                    dropout=config.dropout_rate,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    lp_num=config.lp_num
+                                                )
+                
+                elif config.lp_dim_ratio:
+                    logger.warning("Using AsymMixAdapter")
+                    self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
+                                                    dropout=config.dropout_rate,
+                                                    bottleneck=config.mix_n_layers_ffn_bn,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    lp_num=config.lp_num,
+                                                    lp_dim_ratio=config.lp_dim_ratio,
+                                                    local_bn=config.mix_n_layers_ffn_local_bn)
+                else:
+                    logger.warning("Using MixAdapter")
+                    self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+                                                    dropout=config.dropout_rate,
+                                                    bottleneck=config.ffn_bn,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    lp_num=config.lp_num)
+            else:
+                logger.warning("PA bn scaler: {}".format(self.bn_scaler))
+                self.ef_ffn_adapter = Adapter_Layer(self.config,
+                                                dropout=config.dropout_rate,
+                                                bottleneck=config.ffn_bn*self.bn_scaler,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=config.ffn_adapter_scalar,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                )
+
+    def forward(self, hidden_states,
+                annos=None, hypernet=None):
         forwarded_states = self.layer_norm(hidden_states)
+        if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
+            # NOTE: change before of after LayerNorm
+            if self.forward_annos:
+                assert annos is not None
+                # print('forward_annos', self.forward_annos)
+                # print('is_decoder', self.config.is_decoder)
+                # print('ef_ffn_adapter type', type(self.ef_ffn_adapter))
+                adapter_change = self.ef_ffn_adapter(forwarded_states, annos, hypernet=hypernet, add_residual=False)
+            else:
+                adapter_change = self.ef_ffn_adapter(forwarded_states, add_residual=False)
         forwarded_states = self.DenseReluDense(forwarded_states)
+
         hidden_states = hidden_states + self.dropout(forwarded_states)
+        if 'adapter' in self.config.ffn_mode:
+            if self.config.ffn_option == 'sequential':
+                # NOTE: change before of after LayerNorm
+                hidden_states = self.ef_ffn_adapter(forwarded_states)
+            elif self.config.ffn_option == 'parallel':
+                hidden_states = hidden_states + adapter_change
+            else:
+                raise ValueError
         return hidden_states
 
 
 class T5Attention(nn.Module):
-    def __init__(self, config: T5Config, has_relative_attention_bias=False):
+    def __init__(self, config: T5Config, has_relative_attention_bias=False,
+                cache_key=None,
+                layer_id=0):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.has_relative_attention_bias = has_relative_attention_bias
@@ -316,15 +416,44 @@ class T5Attention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
-        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        embed_dim = self.d_model
+        if config.attn_mode == "lora":
+            self.q = Linear(embed_dim, embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+            self.v = Linear(embed_dim, embed_dim, r=config.attn_bn, lora_alpha=config.lora_alpha,
+                                 lora_dropout=config.lora_dropout, lora_init=config.lora_init)
+        else:
+            self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+            self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
+            
+
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
         self.pruned_heads = set()
         self.gradient_checkpointing = getattr(config, "gradient_checkpointing", False)
+
+        # assert cache_key in ['self', 'encoder_decoder', 'encoder']
+        self.attn_mode = config.attn_mode
+        self.config = config
+        self.cache_key = cache_key
+
+        self.layer_id = layer_id
+
+        if 'prefix' in self.attn_mode:
+            # "cross_attn" is prefix tuning with vanilla add composation
+            # "cross_attn_relu" is multi-head adapter
+            if self.config.attn_option == 'cross_attn' or self.config.attn_option == 'cross_attn_relu':
+                self.ef_transform_layer_norm = nn.LayerNorm(embed_dim)
+
+        elif self.attn_mode == 'adapter':
+            self.ef_attn_adapter = Adapter_Layer(self.config,
+                                                 dropout=self.dropout,
+                                                 bottleneck=self.config.attn_bn,
+                                                 adapter_layernorm_option="in",
+                                                 )
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -592,7 +721,7 @@ class T5LayerCrossAttention(nn.Module):
 
 
 class T5Block(nn.Module):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False, layer_id=0):
         super().__init__()
         self.is_decoder = config.is_decoder
         self.layer = nn.ModuleList()
@@ -600,7 +729,8 @@ class T5Block(nn.Module):
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))
 
-        self.layer.append(T5LayerFF(config))
+        self.layer.append(T5LayerFF(config, layer_id))
+        self.layer_id = layer_id
 
     def forward(
         self,
@@ -616,6 +746,10 @@ class T5Block(nn.Module):
         use_cache=False,
         output_attentions=False,
         return_dict=True,
+        prefix_state=None,
+        p_prime=None,
+        annos=None,
+        hypernet=None,
     ):
 
         if past_key_value is not None:
@@ -686,7 +820,7 @@ class T5Block(nn.Module):
             attention_outputs = attention_outputs + cross_attention_outputs[2:]
 
         # Apply Feed Forward layer
-        hidden_states = self.layer[-1](hidden_states)
+        hidden_states = self.layer[-1](hidden_states, annos, hypernet)
 
         # clamp inf values to enable fp16 training
         if hidden_states.dtype == torch.float16 and torch.isinf(hidden_states).any():
@@ -801,8 +935,26 @@ class T5Stack(T5PreTrainedModel):
         self.embed_tokens = embed_tokens
         self.is_decoder = config.is_decoder
 
+
+        self.ef_ffn_hypernet_controller = None
+        if not self.is_decoder and config.enable_hypernet:
+
+            # attn_option not implemented yet
+            if config.ffn_mode=='adapter':
+                self.ef_ffn_hypernet_controller = LayerAnnoController(
+                                                    config=config,
+                                                    n_layers=config.num_layers,
+                                                    local_bn=config.ffn_bn,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    )
+            else:
+                print(config.ffn_mode, config.ffn_option)
+                raise NotImplementedError
+
         self.block = nn.ModuleList(
-            [T5Block(config, has_relative_attention_bias=bool(i == 0)) for i in range(config.num_layers)]
+            [T5Block(config, has_relative_attention_bias=bool(i == 0), layer_id=i) for i in range(config.num_layers)]
         )
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
@@ -865,7 +1017,14 @@ class T5Stack(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        prefix_state=None,
+        p_prime=None,
+        annos=None,
     ):
+
+        if self.config.attn_mode == 'dlisa' and prefix_state is not None and hasattr(prefix_state, 'biases') and prefix_state.biases is not None:
+            prefix_state = prefix_state.biases
+
         # Model parallel
         if self.model_parallel:
             torch.cuda.set_device(self.first_device)
@@ -993,6 +1152,14 @@ class T5Stack(T5PreTrainedModel):
                     None,  # past_key_value is always None with gradient checkpointing
                 )
             else:
+
+                # print("before prefix is none: {}, idx = {}".format(prefix_state is None, idx))
+                if prefix_state is not None:
+                    pass_prefix_state = prefix_state[i] if isinstance(prefix_state, list) else prefix_state
+                else:
+                    pass_prefix_state = None
+                # print("after prefix is none: {}, idx = {}".format(pass_prefix_state, idx))
+
                 layer_outputs = layer_module(
                     hidden_states,
                     attention_mask=extended_attention_mask,
@@ -1005,6 +1172,10 @@ class T5Stack(T5PreTrainedModel):
                     past_key_value=past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    prefix_state=pass_prefix_state,
+                    p_prime=p_prime,
+                    annos=annos,
+                    hypernet=self.ef_ffn_hypernet_controller,
                 )
 
             # layer_outputs is a tuple with:
@@ -1445,6 +1616,11 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
         decoder_config.num_layers = config.num_decoder_layers
+        # NOTE by zian: double decoder PETL bottleneck when mix
+        if config.mix:
+            decoder_config.attn_bn = config.attn_bn * 2
+            decoder_config.ffn_bn = config.ffn_bn * 2
+            logger.warning("Double bottleneck for decoder!")
         self.decoder = T5Stack(decoder_config, self.shared)
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -1454,6 +1630,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         # Model parallel
         self.model_parallel = False
         self.device_map = None
+
+        self.config = config
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
@@ -1519,6 +1697,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        prefix_state=None,
+        p_prime=None,
+        annos=None,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -1544,6 +1725,14 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             >>> input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you ", return_tensors="pt").input_ids  # Batch size 1
             >>> outputs = model.generate(input_ids)
         """
+
+        assert attention_mask is not None
+        if self.config.attn_mode == "prompt_tuning" and encoder_outputs is None:
+            # training time
+            attention_mask = torch.cat(
+                [torch.ones(decoder_input_ids.size(0), self.config.attn_bn).to(decoder_input_ids.device), attention_mask], dim=1)
+
+
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1564,6 +1753,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                prefix_state=prefix_state,
+                p_prime=p_prime,
+                annos=annos,
             )
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
@@ -1615,6 +1807,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            prefix_state=prefix_state,
+            p_prime=p_prime,    # No need of annos (None)
         )
 
         sequence_output = decoder_outputs[0]
@@ -1654,7 +1848,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             encoder_attentions=encoder_outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(
+    def prepare_inputs_for_generation(  # NOTE by zian: might not use this
         self,
         input_ids,
         past=None,
@@ -1671,6 +1865,17 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         if past is not None:
             input_ids = input_ids[:, -1:]
 
+        p_prime = None
+
+        assert attention_mask is not None
+        if self.config.attn_mode == "prompt_tuning":
+            attention_mask = torch.cat(
+                [torch.ones(input_ids.size(0), self.config.attn_bn).to(input_ids.device), attention_mask], dim=1)
+
+        # print("generate")
+        # logger.info(kwargs["prefix_state"].biases[6]["self"]["prev_key"][:2])
+        # input()
+
         return {
             "decoder_input_ids": input_ids,
             "past_key_values": past,
@@ -1680,6 +1885,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
             "use_cache": use_cache,
+            "prefix_state": kwargs["prefix_state"] if "prefix_state" in kwargs else None,
+            "p_prime": p_prime,
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
