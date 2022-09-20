@@ -313,31 +313,31 @@ class GPT2Block(nn.Module):
 
         if config.ffn_mode == 'adapter':
             # import pdb; pdb.set_trace()
-            # self.ef_ffn_adapter = Adapter_Layer(self.config,
-            #                                     dropout=self.dropout,
+            self.ef_ffn_adapter = Adapter_Layer(self.config,
+                                                # dropout=self.dropout,
+                                                bottleneck=config.ffn_bn,
+                                                init_option=config.ffn_adapter_init_option,
+                                                adapter_scalar=config.ffn_adapter_scalar,
+                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                )
+            # if config.lp_dim_ratio:
+            #     self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
+            #                                     dropout=0.0,
             #                                     bottleneck=config.ffn_bn,
             #                                     init_option=config.ffn_adapter_init_option,
             #                                     adapter_scalar=config.ffn_adapter_scalar,
             #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-            #                                     )
-            if config.lp_dim_ratio:
-                self.ef_ffn_adapter = AsymMixAdapter_Layer(self.config,
-                                                dropout=0.0,
-                                                bottleneck=config.ffn_bn,
-                                                init_option=config.ffn_adapter_init_option,
-                                                adapter_scalar=config.ffn_adapter_scalar,
-                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                lp_num=7,
-                                                lp_dim_ratio=config.lp_dim_ratio)
-            else:
-                self.ef_ffn_adapter = MixAdapter_Layer(self.config,
-                                                dropout=0.0,
-                                                bottleneck=config.ffn_bn,
-                                                init_option=config.ffn_adapter_init_option,
-                                                adapter_scalar=config.ffn_adapter_scalar,
-                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                lp_num=7)
-                                                # lp_num=config.lp_num)
+            #                                     lp_num=7,
+            #                                     lp_dim_ratio=config.lp_dim_ratio)
+            # else:
+            #     self.ef_ffn_adapter = MixAdapter_Layer(self.config,
+            #                                     dropout=0.0,
+            #                                     bottleneck=config.ffn_bn,
+            #                                     init_option=config.ffn_adapter_init_option,
+            #                                     adapter_scalar=config.ffn_adapter_scalar,
+            #                                     adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+            #                                     lp_num=7)
+            #                                     # lp_num=config.lp_num)
 
     def forward(
         self,
@@ -393,7 +393,8 @@ class GPT2Block(nn.Module):
 
         if 'adapter' in self.config.ffn_mode and self.config.ffn_option == 'parallel':
             # import pdb; pdb.set_trace()
-            adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            # adapter_change = self.ef_ffn_adapter(hidden_states, annos, add_residual=False)
+            adapter_change = self.ef_ffn_adapter(hidden_states, add_residual=False)
 
 
         residual = hidden_states
